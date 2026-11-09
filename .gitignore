@@ -1,0 +1,14 @@
+.DS_Store
+.build/
+
+/temp
+/log
+
+xcuserdata/
+*.xcuserstate
+.swiftpm/
+Package.resolved
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
