@@ -1,0 +1,1038 @@
+--- a/include/ghostty/vt/terminal.h
++++ b/include/ghostty/vt/terminal.h
+@@ -2387,6 +2387,41 @@
+  *
+  * @ingroup terminal
+  */
++// BEGIN sandbox-station durable-history header v2
++typedef struct {
++  uint64_t fragment_id;
++  uint64_t line_id;
++  const uint8_t* data;
++  size_t len;
++  uint16_t columns;
++  uint16_t start_column;
++  uint16_t cells;
++  uint8_t flags;
++} GhosttyHistoryFragment;
++
++// One archived row: data is the history row payload; flags bit 0 marks a
++// soft wrap into the next row, bit 1 a wide character continued there.
++// Callback return acknowledges durable storage. Block on storage failure.
++// Data is borrowed; no terminal API may run concurrently or reentrantly.
++typedef void (*GhosttyHistoryFn)(void*, const GhosttyHistoryFragment*);
++GHOSTTY_API GhosttyResult ghostty_terminal_history_set_callback(
++    GhosttyTerminal, GhosttyHistoryFn, void*);
++GHOSTTY_API GhosttyResult ghostty_terminal_history_finish(GhosttyTerminal);
++
++typedef struct {
++  uint64_t next_fragment_id;
++  uint64_t line_id;
++  uint64_t boundary_row;
++  uint64_t total_rows;
++  uint64_t active_rows;
++  uint16_t boundary_column;
++  bool finished;
++} GhosttyHistoryFrontier;
++
++GHOSTTY_API GhosttyResult ghostty_terminal_history_frontier(
++    GhosttyTerminal, GhosttyHistoryFrontier*);
++// END sandbox-station durable-history header
++
+ GHOSTTY_API void ghostty_terminal_vt_write(GhosttyTerminal terminal,
+                                 const uint8_t* data,
+                                 size_t len);
+--- a/src/lib_vt.zig
++++ b/src/lib_vt.zig
+@@ -321,6 +321,9 @@
+         @export(&c.terminal_resize, .{ .name = "ghostty_terminal_resize" });
+         @export(&c.terminal_set, .{ .name = "ghostty_terminal_set" });
+         @export(&c.terminal_vt_write, .{ .name = "ghostty_terminal_vt_write" });
++        @export(&c.terminal_history_set_callback, .{ .name = "ghostty_terminal_history_set_callback" });
++        @export(&c.terminal_history_finish, .{ .name = "ghostty_terminal_history_finish" });
++        @export(&c.terminal_history_frontier, .{ .name = "ghostty_terminal_history_frontier" });
+         @export(&c.terminal_vt_write_until_ground, .{ .name = "ghostty_terminal_vt_write_until_ground" });
+         @export(&c.terminal_scroll_viewport, .{ .name = "ghostty_terminal_scroll_viewport" });
+         @export(&c.terminal_compression_activity, .{ .name = "ghostty_terminal_compression_activity" });
+--- a/src/terminal/PageList.zig
++++ b/src/terminal/PageList.zig
+@@ -449,6 +449,13 @@
+ /// outside of an in-progress reflow.
+ recycle_node: ?*List.Node = null,
+ 
++history_observer: ?struct {
++    callback: *const fn (*anyopaque, *PageList, usize) void,
++    userdata: *anyopaque,
++    boundary: *Pin,
++    reset: *const fn (*anyopaque) void,
++} = null,
++
+ /// Limits for scrollback.
+ limits: Limits,
+ 
+@@ -519,6 +526,10 @@
+     pin,
+ };
+ 
++fn historyBeforeDiscard(self: *PageList, additional_rows: usize) void {
++    if (self.history_observer) |observer| observer.callback(observer.userdata, self, additional_rows);
++}
++
+ /// Calculates the initial capacity for a new page for a given column
+ /// count. This will attempt to fit within std_size at all times so we
+ /// can use our memory pool, but if cols is too big, this will return a
+@@ -982,6 +993,8 @@
+ /// This can't fail because we always retain at least enough allocated
+ /// memory to fit the active area.
+ pub fn reset(self: *PageList) void {
++    self.historyBeforeDiscard(0);
++    if (self.history_observer) |observer| observer.reset(observer.userdata);
+     defer self.assertIntegrity();
+ 
+     // Reset discards all scrollback, so there is nothing left to compress.
+@@ -1692,6 +1705,13 @@
+                 // This row has pins
+                 row_has_pins = true;
+ 
++                if (list.history_observer) |observer| {
++                    if (p == observer.boundary) {
++                        cols_len = @max(cols_len, p.x + 1);
++                        continue;
++                    }
++                }
++
+                 if (cursor_pin != null and p == cursor_pin.?) continue;
+ 
+                 // If this pin is in the blanks on the right and past the end
+@@ -4039,6 +4059,9 @@
+         self.pages.first != self.pages.last and
+         self.page_size + PagePool.item_size > self.limits.max(.bytes))
+     prune: {
++        if (self.total_rows + 1 >= self.pages.first.?.rows() + self.rows) {
++            self.historyBeforeDiscard(if (self.total_rows - self.pages.first.?.rows() < self.rows) 1 else 0);
++        }
+         const first = self.pages.popFirst().?;
+         assert(first != last);
+ 
+@@ -5481,6 +5504,7 @@
+     self: *PageList,
+     bl_pt: ?point.Point,
+ ) void {
++    self.historyBeforeDiscard(0);
+     self.eraseRows(.{ .history = .{} }, bl_pt);
+ }
+ 
+@@ -7011,6 +7035,8 @@
+ 
+             if (removed == 0) pagelist.page_compression.markActivity();
+ 
++            pagelist.historyBeforeDiscard(0);
++
+             const first_rows = first.rows();
+ 
+             // Automatic pruning invalidates the content represented by pins in
+--- a/src/terminal/Screen.zig
++++ b/src/terminal/Screen.zig
+@@ -930,7 +930,7 @@
+     }
+ 
+     // If we have no scrollback, then we shift all our rows instead.
+-    if (self.no_scrollback) {
++    if (self.no_scrollback and self.pages.history_observer == null) {
+         // If we have a single-row screen, we have no rows to shift
+         // so our cursor is in the correct place we just have to clear
+         // the cells.
+--- a/src/terminal/c/main.zig
++++ b/src/terminal/c/main.zig
+@@ -187,6 +187,9 @@
+ pub const terminal_resize = terminal.resize;
+ pub const terminal_set = terminal.set;
+ pub const terminal_vt_write = terminal.vt_write;
++pub const terminal_history_set_callback = terminal.history_set_callback;
++pub const terminal_history_finish = terminal.history_finish;
++pub const terminal_history_frontier = terminal.history_frontier;
+ pub const terminal_vt_write_until_ground = terminal.vt_write_until_ground;
+ pub const terminal_scroll_viewport = terminal.scroll_viewport;
+ pub const terminal_compression_activity = terminal.compression_activity;
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -84,6 +84,7 @@
+     terminfo_name_buf: [Handler.max_terminfo_name_bytes]u8,
+     stream: Stream,
+     effects: Effects = .{},
++    history: ?*History = null,
+     tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
+     searches: std.AutoArrayHashMapUnmanaged(*search_c.SearchWrapper, void) = .{},
+ 
+@@ -870,6 +871,423 @@
+     );
+ }
+ 
++// BEGIN sandbox-station durable-history native v2
++pub const HistoryFragment = extern struct {
++    fragment_id: u64,
++    line_id: u64,
++    data: [*]const u8,
++    len: usize,
++    columns: u16,
++    start_column: u16,
++    cells: u16,
++    flags: u8,
++};
++
++pub const history_flag_wrap: u8 = 1;
++pub const history_flag_spacer_head: u8 = 2;
++
++pub const HistoryFn = *const fn (?*anyopaque, *const HistoryFragment) callconv(lib.calling_conv) void;
++
++pub const HistoryFrontier = extern struct {
++    next_fragment_id: u64,
++    line_id: u64,
++    boundary_row: u64,
++    total_rows: u64,
++    active_rows: u64,
++    boundary_column: u16,
++    finished: bool,
++};
++
++const history_payload_limit = 65536;
++const history_style_limit = 255;
++const history_link_limit = 63;
++
++/// Encodes one row as the history row payload: wide heads, text, graphemes,
++/// styles, links and style/link runs. See sandbox-station's history contract.
++const HistoryRowEncoder = struct {
++    page: *const @import("../page.zig").Page,
++    cells: []const @import("../page.zig").Cell,
++    start: usize,
++    end: usize,
++    full: bool,
++    styles: bool,
++    out: []u8,
++    used: usize = 0,
++    style_keys: [history_style_limit]u64 = undefined,
++    style_count: usize = 0,
++    link_ids: [history_link_limit]u32 = undefined,
++    link_count: usize = 0,
++
++    const Cell = @import("../page.zig").Cell;
++
++    fn byte(self: *HistoryRowEncoder, value: u8) void {
++        if (self.used >= self.out.len) {
++            self.full = true;
++            return;
++        }
++        self.out[self.used] = value;
++        self.used += 1;
++    }
++
++    fn bytes(self: *HistoryRowEncoder, value: []const u8) void {
++        if (self.out.len - self.used < value.len) {
++            self.full = true;
++            self.used = self.out.len;
++            return;
++        }
++        @memcpy(self.out[self.used..][0..value.len], value);
++        self.used += value.len;
++    }
++
++    fn varint(self: *HistoryRowEncoder, value_: u64) void {
++        var value = value_;
++        while (value >= 0x80) {
++            self.byte(@as(u8, @truncate(value)) | 0x80);
++            value >>= 7;
++        }
++        self.byte(@truncate(value));
++    }
++
++    fn isHead(self: *const HistoryRowEncoder, column: usize) bool {
++        return self.cells[column].wide == .wide and column + 1 < self.end and self.cells[column + 1].wide == .spacer_tail;
++    }
++
++    fn isTail(self: *const HistoryRowEncoder, column: usize) bool {
++        return column > self.start and self.isHead(column - 1);
++    }
++
++    fn styleKey(self: *const HistoryRowEncoder, cell: *const Cell) u64 {
++        if (!self.styles) return 0;
++        return switch (cell.content_tag) {
++            .bg_color_palette => (@as(u64, 1) << 32) | cell.content.color_palette.data,
++            .bg_color_rgb => (@as(u64, 2) << 32) | (@as(u64, cell.content.color_rgb.r) << 16) | (@as(u64, cell.content.color_rgb.g) << 8) | cell.content.color_rgb.b,
++            else => if (cell.style_id == 0) 0 else (@as(u64, 3) << 32) | cell.style_id,
++        };
++    }
++
++    fn styleIndex(self: *HistoryRowEncoder, key: u64) usize {
++        if (key == 0) return 0;
++        for (self.style_keys[0..self.style_count], 1..) |existing, index| {
++            if (existing == key) return index;
++        }
++        if (self.style_count == self.style_keys.len) return 0;
++        self.style_keys[self.style_count] = key;
++        self.style_count += 1;
++        return self.style_count;
++    }
++
++    fn linkIndex(self: *HistoryRowEncoder, cell: *const Cell) usize {
++        if (!self.styles or !cell.hyperlink) return 0;
++        const id = self.page.lookupHyperlink(cell) orelse return 0;
++        for (self.link_ids[0..self.link_count], 1..) |existing, index| {
++            if (existing == id) return index;
++        }
++        if (self.link_count == self.link_ids.len) return 0;
++        self.link_ids[self.link_count] = id;
++        self.link_count += 1;
++        return self.link_count;
++    }
++
++    fn color(self: *HistoryRowEncoder, value: @import("../style.zig").Style.Color) void {
++        switch (value) {
++            .none => self.byte(0),
++            .palette => |index| {
++                self.byte(1);
++                self.byte(index);
++            },
++            .rgb => |rgb| {
++                self.byte(2);
++                self.bytes(&.{ rgb.r, rgb.g, rgb.b });
++            },
++        }
++    }
++
++    fn encode(self: *HistoryRowEncoder) void {
++        self.used = 0;
++        self.full = false;
++        self.style_count = 0;
++        self.link_count = 0;
++
++        var count: usize = 0;
++        for (self.start..self.end) |column| {
++            if (self.isHead(column) and !self.isTail(column)) count += 1;
++        }
++        self.varint(count);
++        var previous = self.start;
++        for (self.start..self.end) |column| {
++            if (!self.isHead(column) or self.isTail(column)) continue;
++            self.varint(column - previous);
++            previous = column;
++        }
++
++        var text: [4]u8 = undefined;
++        count = 0;
++        for (self.start..self.end) |column| {
++            if (self.isTail(column)) continue;
++            count += std.unicode.utf8Encode(self.cells[column].codepoint(), &text) catch 1;
++        }
++        self.varint(count);
++        for (self.start..self.end) |column| {
++            if (self.isTail(column)) continue;
++            const length = std.unicode.utf8Encode(self.cells[column].codepoint(), &text) catch blk: {
++                text[0] = 0;
++                break :blk 1;
++            };
++            self.bytes(text[0..length]);
++        }
++
++        count = 0;
++        if (self.styles) for (self.start..self.end) |column| {
++            const cell = &self.cells[column];
++            if (cell.content_tag == .codepoint_grapheme and !self.isTail(column) and self.page.lookupGrapheme(cell) != null) count += 1;
++        };
++        self.varint(count);
++        previous = self.start;
++        if (self.styles) for (self.start..self.end) |column| {
++            const cell = &self.cells[column];
++            if (cell.content_tag != .codepoint_grapheme or self.isTail(column)) continue;
++            const extra = self.page.lookupGrapheme(cell) orelse continue;
++            self.varint(column - previous);
++            previous = column;
++            self.varint(extra.len);
++            for (extra) |codepoint| self.varint(codepoint);
++        };
++
++        // Runs are measured before the tables so the tables hold every referenced entry.
++        var runs: usize = 0;
++        var run_style: usize = std.math.maxInt(usize);
++        var run_link: usize = std.math.maxInt(usize);
++        for (self.start..self.end) |column| {
++            const source = if (self.isTail(column)) &self.cells[column - 1] else &self.cells[column];
++            const style = self.styleIndex(self.styleKey(source));
++            const link = self.linkIndex(source);
++            if (style != run_style or link != run_link) {
++                runs += 1;
++                run_style = style;
++                run_link = link;
++            }
++        }
++
++        self.varint(self.style_count);
++        for (self.style_keys[0..self.style_count]) |key| {
++            const tag = key >> 32;
++            const value: u32 = @truncate(key);
++            var style: @import("../style.zig").Style = .{};
++            switch (tag) {
++                1 => style.bg_color = .{ .palette = @truncate(value) },
++                2 => style.bg_color = .{ .rgb = .{ .r = @truncate(value >> 16), .g = @truncate(value >> 8), .b = @truncate(value) } },
++                else => style = self.page.styles.get(self.page.memory, @intCast(value)).*,
++            }
++            self.varint(@as(u16, @bitCast(style.flags)));
++            self.color(style.fg_color);
++            self.color(style.bg_color);
++            self.color(style.underline_color);
++        }
++
++        self.varint(self.link_count);
++        for (self.link_ids[0..self.link_count]) |id| {
++            const entry = self.page.hyperlink_set.get(self.page.memory, @intCast(id));
++            const uri = entry.uri.offset.ptr(self.page.memory)[0..entry.uri.len];
++            self.varint(uri.len);
++            self.bytes(uri);
++            switch (entry.id) {
++                .explicit => |slice| {
++                    const explicit = slice.offset.ptr(self.page.memory)[0..slice.len];
++                    self.varint(explicit.len);
++                    self.bytes(explicit);
++                },
++                .implicit => self.varint(0),
++            }
++        }
++
++        self.varint(runs);
++        var length: usize = 0;
++        run_style = std.math.maxInt(usize);
++        run_link = std.math.maxInt(usize);
++        for (self.start..self.end) |column| {
++            const source = if (self.isTail(column)) &self.cells[column - 1] else &self.cells[column];
++            const style = self.styleIndex(self.styleKey(source));
++            const link = self.linkIndex(source);
++            if (style != run_style or link != run_link) {
++                if (length > 0) {
++                    self.varint(length);
++                    self.varint(run_style);
++                    self.varint(run_link);
++                }
++                length = 0;
++                run_style = style;
++                run_link = link;
++            }
++            length += 1;
++        }
++        if (length > 0) {
++            self.varint(length);
++            self.varint(run_style);
++            self.varint(run_link);
++        }
++    }
++};
++
++const History = struct {
++    callback: HistoryFn,
++    userdata: ?*anyopaque,
++    boundary: *PageList.Pin,
++    fragment_id: u64 = 1,
++    line_id: u64 = 1,
++    buffer: [history_payload_limit]u8 = undefined,
++    line_open: bool = false,
++    finishing: bool = false,
++    finished: bool = false,
++
++    fn emit(self: *History, payload: []const u8, columns: u16, start: u16, cells: u16, flags: u8) void {
++        const fragment: HistoryFragment = .{
++            .fragment_id = self.fragment_id,
++            .line_id = self.line_id,
++            .data = payload.ptr,
++            .len = payload.len,
++            .columns = columns,
++            .start_column = start,
++            .cells = cells,
++            .flags = flags,
++        };
++        // Returning acknowledges durable ownership; blocking retains this exact native operation.
++        self.callback(self.userdata, &fragment);
++        self.fragment_id += 1;
++        const wrapped = flags & history_flag_wrap != 0;
++        self.line_open = wrapped;
++        if (!wrapped) self.line_id += 1;
++    }
++};
++
++pub fn history_set_callback(
++    terminal_: Terminal,
++    callback: ?HistoryFn,
++    userdata: ?*anyopaque,
++) callconv(lib.calling_conv) Result {
++    const wrapper = terminal_ orelse return .invalid_value;
++    const pages = &wrapper.terminal.screens.get(.primary).?.pages;
++    if (wrapper.history != null) return .invalid_value;
++    const func = callback orelse return .invalid_value;
++    const boundary = pages.trackPin(pages.getTopLeft(.screen)) catch return .out_of_memory;
++    const history = wrapper.terminal.gpa().create(History) catch {
++        pages.untrackPin(boundary);
++        return .out_of_memory;
++    };
++    history.* = .{ .callback = func, .userdata = userdata, .boundary = boundary };
++    wrapper.history = history;
++    pages.history_observer = .{ .callback = historyBeforeDiscard, .userdata = wrapper, .boundary = boundary, .reset = historyReset };
++    historyFlush(wrapper, 0);
++    return .success;
++}
++
++pub fn history_finish(terminal_: Terminal) callconv(lib.calling_conv) Result {
++    const wrapper = terminal_ orelse return .invalid_value;
++    const history = wrapper.history orelse return .invalid_value;
++    if (history.finished) return .success;
++    history.finishing = true;
++    historyFlush(wrapper, wrapper.terminal.screens.get(.primary).?.pages.rows);
++    history.finished = true;
++    return .success;
++}
++
++pub fn history_frontier(terminal_: Terminal, out: ?*HistoryFrontier) callconv(lib.calling_conv) Result {
++    const wrapper = terminal_ orelse return .invalid_value;
++    const result = out orelse return .invalid_value;
++    const history = wrapper.history orelse return .invalid_value;
++    const pages = &wrapper.terminal.screens.get(.primary).?.pages;
++    const pin = if (history.boundary.garbage) pages.getTopLeft(.screen) else history.boundary.*;
++    const position = if (history.finished) null else pages.pointFromPin(.screen, pin) orelse return .invalid_value;
++    result.* = .{
++        .next_fragment_id = history.fragment_id,
++        .line_id = history.line_id,
++        .boundary_row = if (history.finished) pages.total_rows else position.?.screen.y,
++        .total_rows = pages.total_rows,
++        .active_rows = pages.rows,
++        .boundary_column = if (history.finished) 0 else pin.x,
++        .finished = history.finished,
++    };
++    return .success;
++}
++
++fn historyReset(userdata: *anyopaque) void {
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(userdata));
++    const history = wrapper.history orelse return;
++    if (history.line_open) {
++        const pages = &wrapper.terminal.screens.get(.primary).?.pages;
++        // An empty payload: no wide cells, text, graphemes, styles, links or runs.
++        history.emit(&.{ 0, 0, 0, 0, 0, 0 }, @intCast(pages.cols), 0, 0, 0);
++    }
++}
++
++fn historyBeforeDiscard(userdata: *anyopaque, _: *PageList, additional_rows: usize) void {
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(userdata));
++    historyFlush(wrapper, additional_rows);
++}
++
++fn historyFlush(wrapper: *TerminalWrapper, additional_rows: usize) void {
++    const history = wrapper.history orelse return;
++    if (history.finished) return;
++    const pages = &wrapper.terminal.screens.get(.primary).?.pages;
++    if (history.boundary.garbage) {
++        history.boundary.* = pages.getTopLeft(.screen);
++    }
++    const history_rows = pages.total_rows -| pages.rows;
++    const limit = @min(pages.total_rows, history_rows + additional_rows);
++    while (true) {
++        const position = pages.pointFromPin(.screen, history.boundary.*) orelse unreachable;
++        if (position.screen.y >= limit) break;
++        const pin = history.boundary.*;
++        const page = pin.node.page();
++        const row = page.getRow(pin.y);
++        const cells = page.getCells(row);
++        const columns: usize = page.size.cols;
++        const wrapped = row.wrap and !(history.finishing and position.screen.y + 1 == limit);
++        var end: usize = columns;
++        var flags: u8 = if (wrapped) history_flag_wrap else 0;
++        if (wrapped) {
++            if (end > 0 and cells[end - 1].wide == .spacer_head) {
++                end -= 1;
++                flags |= history_flag_spacer_head;
++            }
++        } else {
++            while (end > pin.x) {
++                const cell = &cells[end - 1];
++                if (cell.hasText() or cell.content_tag == .bg_color_palette or cell.content_tag == .bg_color_rgb or
++                    cell.style_id != 0 or cell.hyperlink or cell.wide == .spacer_tail) break;
++                end -= 1;
++            }
++        }
++        const start: usize = @min(pin.x, end);
++        var encoder: HistoryRowEncoder = .{
++            .page = page,
++            .cells = cells,
++            .start = start,
++            .end = end,
++            .full = false,
++            .styles = true,
++            .out = &history.buffer,
++        };
++        encoder.encode();
++        // A row too large for one record keeps its text and drops attributes, then columns.
++        if (encoder.full) {
++            encoder.styles = false;
++            encoder.encode();
++        }
++        while (encoder.full and encoder.end > encoder.start) {
++            encoder.end = encoder.start + (encoder.end - encoder.start) / 2;
++            encoder.encode();
++        }
++        history.emit(history.buffer[0..encoder.used], @intCast(columns), @intCast(start), @intCast(encoder.end), flags);
++        const next = pin.down(1) orelse {
++            std.debug.assert(history.finishing);
++            break;
++        };
++        history.boundary.* = next;
++        history.boundary.x = 0;
++    }
++}
++// END sandbox-station durable-history native
++
+ pub fn vt_write(
+     terminal_: Terminal,
+     ptr: [*]const u8,
+@@ -877,6 +1295,7 @@
+ ) callconv(lib.calling_conv) void {
+     const wrapper = terminal_ orelse return;
+     wrapper.stream.nextSlice(ptr[0..len]);
++    historyFlush(wrapper, 0);
+ }
+ 
+ pub fn vt_write_until_ground(
+@@ -1525,6 +1944,7 @@
+         error.InvalidValue => .invalid_value,
+         error.OutOfMemory => .out_of_memory,
+     };
++    historyFlush(wrapper, 0);
+ 
+     return .success;
+ }
+@@ -1856,6 +2276,12 @@
+     const t = wrapper.terminal;
+     const alloc = t.gpa();
+ 
++    if (wrapper.history) |history| {
++        const pages = &t.screens.get(.primary).?.pages;
++        pages.history_observer = null;
++        pages.untrackPin(history.boundary);
++        alloc.destroy(history);
++    }
+     for (wrapper.tracked_grid_refs.keys()) |ref| ref.terminal = null;
+     wrapper.tracked_grid_refs.deinit(alloc);
+     for (wrapper.searches.keys()) |search| search.terminal = null;
+@@ -1875,6 +2301,418 @@
+     );
+ }
+ 
++// BEGIN sandbox-station durable-history tests v2
++const HistoryTestSink = struct {
++    x_count: usize = 0,
++    next_fragment: u64 = 1,
++    last_line: u64 = 1,
++    rows: usize = 0,
++
++    fn receive(userdata: ?*anyopaque, fragment: *const HistoryFragment) callconv(lib.calling_conv) void {
++        const self: *HistoryTestSink = @ptrCast(@alignCast(userdata.?));
++        std.debug.assert(fragment.fragment_id == self.next_fragment);
++        std.debug.assert(fragment.line_id >= self.last_line);
++        std.debug.assert(fragment.start_column <= fragment.cells and fragment.cells <= fragment.columns);
++        self.next_fragment += 1;
++        self.last_line = fragment.line_id;
++        const row = HistoryTestRow.decode(fragment);
++        self.x_count += std.mem.count(u8, row.text(), "X");
++        self.rows += 1;
++    }
++};
++
++/// Decodes a history row payload, failing the test on any malformed field.
++const HistoryTestRow = struct {
++    payload: []const u8,
++    wide: [64]usize = undefined,
++    wide_count: usize = 0,
++    text_start: usize = 0,
++    text_end: usize = 0,
++    graphemes: usize = 0,
++    grapheme_codepoints: [8]u32 = undefined,
++    styles: [8][4]u64 = undefined,
++    style_count: usize = 0,
++    links: [4][]const u8 = undefined,
++    link_ids: [4][]const u8 = undefined,
++    link_count: usize = 0,
++    runs: [16][3]usize = undefined,
++    run_count: usize = 0,
++    position: usize = 0,
++    flags: u8 = 0,
++    start: usize = 0,
++    cells: usize = 0,
++
++    fn varint(self: *HistoryTestRow) u64 {
++        var value: u64 = 0;
++        var shift: u6 = 0;
++        while (true) {
++            const b = self.payload[self.position];
++            self.position += 1;
++            value |= @as(u64, b & 0x7f) << shift;
++            if (b & 0x80 == 0) return value;
++            shift += 7;
++        }
++    }
++
++    fn color(self: *HistoryTestRow) u64 {
++        const tag = self.payload[self.position];
++        self.position += 1;
++        return switch (tag) {
++            0 => 0,
++            1 => blk: {
++                self.position += 1;
++                break :blk (@as(u64, 1) << 32) | @as(u64, self.payload[self.position - 1]);
++            },
++            2 => blk: {
++                self.position += 3;
++                break :blk (@as(u64, 2) << 32) | @as(u64, std.mem.readInt(u24, self.payload[self.position - 3 ..][0..3], .big));
++            },
++            else => unreachable,
++        };
++    }
++
++    fn decode(fragment: *const HistoryFragment) HistoryTestRow {
++        var row: HistoryTestRow = .{ .payload = fragment.data[0..fragment.len], .flags = fragment.flags, .start = fragment.start_column, .cells = fragment.cells };
++        row.wide_count = row.varint();
++        var column: usize = fragment.start_column;
++        for (0..row.wide_count) |index| {
++            column += row.varint();
++            if (index < row.wide.len) row.wide[index] = column;
++        }
++        const text_len = row.varint();
++        row.text_start = row.position;
++        row.position += text_len;
++        row.text_end = row.position;
++        std.debug.assert(std.unicode.utf8ValidateSlice(row.text()));
++        std.debug.assert(std.unicode.utf8CountCodepoints(row.text()) catch unreachable == fragment.cells - fragment.start_column - row.wide_count);
++        row.graphemes = row.varint();
++        var cp_index: usize = 0;
++        for (0..row.graphemes) |_| {
++            _ = row.varint();
++            const count = row.varint();
++            for (0..count) |_| {
++                const codepoint = row.varint();
++                if (cp_index < row.grapheme_codepoints.len) row.grapheme_codepoints[cp_index] = @intCast(codepoint);
++                cp_index += 1;
++            }
++        }
++        row.style_count = row.varint();
++        for (0..row.style_count) |index| {
++            const flags = row.varint();
++            row.styles[index] = .{ flags, row.color(), row.color(), row.color() };
++        }
++        row.link_count = row.varint();
++        for (0..row.link_count) |index| {
++            const uri_len = row.varint();
++            row.links[index] = row.payload[row.position..][0..uri_len];
++            row.position += uri_len;
++            const id_len = row.varint();
++            row.link_ids[index] = row.payload[row.position..][0..id_len];
++            row.position += id_len;
++        }
++        row.run_count = row.varint();
++        var covered: usize = 0;
++        for (0..row.run_count) |index| {
++            const run: [3]usize = .{ @intCast(row.varint()), @intCast(row.varint()), @intCast(row.varint()) };
++            std.debug.assert(run[1] <= row.style_count and run[2] <= row.link_count);
++            if (index < row.runs.len) row.runs[index] = run;
++            covered += run[0];
++        }
++        std.debug.assert(covered == fragment.cells - fragment.start_column);
++        std.debug.assert(row.position == row.payload.len);
++        return row;
++    }
++
++    fn text(self: *const HistoryTestRow) []const u8 {
++        return self.payload[self.text_start..self.text_end];
++    }
++};
++
++test "durable history archives before CSI 3J erases scrollback" {
++    var t: Terminal = null;
++    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 4, 2));
++    defer free(t);
++    var sink: HistoryTestSink = .{};
++    try testing.expectEqual(Result.success, history_set_callback(t, HistoryTestSink.receive, &sink));
++    const input = "XXXX\r\nXXXX\r\n\x1b[3J";
++    vt_write(t, input, input.len);
++    try testing.expectEqual(Result.success, history_finish(t));
++    try testing.expectEqual(@as(usize, 8), sink.x_count);
++}
++
++test "durable history archives REP before bounded pruning" {
++    var t: Terminal = null;
++    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 8, 2));
++    defer free(t);
++    const tiny: usize = 0;
++    try testing.expectEqual(Result.success, set(t, .scrollback_max_lines, &tiny));
++    var sink: HistoryTestSink = .{};
++    try testing.expectEqual(Result.success, history_set_callback(t, HistoryTestSink.receive, &sink));
++    const input = "X\x1b[65535b\r\n\r\n";
++    vt_write(t, input, input.len);
++    try testing.expectEqual(@as(usize, 65536), sink.x_count);
++    try testing.expect(sink.rows > 2500);
++    try testing.expect(t.?.terminal.screens.get(.primary).?.pages.total_rows < sink.rows);
++    try testing.expectEqual(@as(u64, 2), t.?.history.?.line_id);
++}
++
++test "durable history resize reflow does not duplicate acknowledged cells" {
++    var t: Terminal = null;
++    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 8, 2));
++    defer free(t);
++    var sink: HistoryTestSink = .{};
++    try testing.expectEqual(Result.success, history_set_callback(t, HistoryTestSink.receive, &sink));
++    const input = "X\x1b[1000b";
++    vt_write(t, input, input.len);
++    for ([_][2]u16{ .{ 3, 2 }, .{ 11, 5 }, .{ 7, 1 }, .{ 8, 2 }, .{ 12, 4 }, .{ 3, 2 } }) |geometry| {
++        try testing.expectEqual(Result.success, resize(t, geometry[0], geometry[1], 8, 16));
++        try testing.expect(sink.x_count <= 1001);
++    }
++    vt_write(t, "\r\n\r\n\r\n\r\n", 8);
++    try testing.expectEqual(@as(usize, 1001), sink.x_count);
++}
++
++test "durable history excludes alternate output and survives RIS" {
++    var t: Terminal = null;
++    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 4, 2));
++    defer free(t);
++    var sink: HistoryTestSink = .{};
++    try testing.expectEqual(Result.success, history_set_callback(t, HistoryTestSink.receive, &sink));
++    const alternate = "\x1b[?1049hX\x1b[100b\x1b[?1049l";
++    vt_write(t, alternate, alternate.len);
++    try testing.expectEqual(@as(usize, 0), sink.x_count);
++    const before = "XXXX\r\nXXXX\r\n\x1bc";
++    vt_write(t, before, before.len);
++    try testing.expectEqual(@as(usize, 4), sink.x_count);
++    const after = "XXXX\r\nXXXX\r\n";
++    vt_write(t, after, after.len);
++    try testing.expectEqual(@as(usize, 8), sink.x_count);
++}
++
++const BlockingHistorySink = struct {
++    sink: HistoryTestSink = .{},
++    armed: std.atomic.Value(bool) = .init(false),
++    blocked: std.atomic.Value(bool) = .init(false),
++    release: std.atomic.Value(bool) = .init(false),
++    done: std.atomic.Value(bool) = .init(false),
++    terminal: Terminal = null,
++    resizing: bool = false,
++
++    fn receive(userdata: ?*anyopaque, fragment: *const HistoryFragment) callconv(lib.calling_conv) void {
++        const self: *BlockingHistorySink = @ptrCast(@alignCast(userdata.?));
++        if (self.armed.swap(false, .acq_rel)) {
++            const id = fragment.fragment_id;
++            self.blocked.store(true, .release);
++            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
++            std.debug.assert(fragment.fragment_id == id);
++        }
++        HistoryTestSink.receive(&self.sink, fragment);
++    }
++
++    fn run(self: *BlockingHistorySink) void {
++        if (self.resizing) {
++            std.debug.assert(resize(self.terminal, 1, 1, 8, 16) == .success);
++        } else {
++            const input = "X\x1b[65535b\r\n\r\n";
++            vt_write(self.terminal, input, input.len);
++        }
++        self.done.store(true, .release);
++    }
++};
++
++test "durable history durable ACK pauses and resumes REP and resize" {
++    for ([_]bool{ false, true }) |resizing| {
++        var t: Terminal = null;
++        try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 8, 2));
++        defer free(t);
++        const tiny: usize = 0;
++        try testing.expectEqual(Result.success, set(t, .scrollback_max_lines, &tiny));
++        var sink: BlockingHistorySink = .{ .terminal = t, .resizing = resizing };
++        try testing.expectEqual(Result.success, history_set_callback(t, BlockingHistorySink.receive, &sink));
++        if (resizing) {
++            const input = "X\x1b[10000b";
++            vt_write(t, input, input.len);
++        }
++        sink.armed.store(true, .release);
++        const worker = try std.Thread.spawn(.{}, BlockingHistorySink.run, .{&sink});
++        defer worker.join();
++        defer sink.release.store(true, .release);
++        while (!sink.blocked.load(.acquire)) {
++            if (sink.done.load(.acquire)) break;
++            std.Thread.yield() catch {};
++        }
++        try testing.expect(sink.blocked.load(.acquire));
++        for (0..100) |_| std.Thread.yield() catch {};
++        try testing.expect(!sink.done.load(.acquire));
++        sink.release.store(true, .release);
++        while (!sink.done.load(.acquire)) std.Thread.yield() catch {};
++        if (resizing) vt_write(t, "\r\n\r\n", 4);
++        try testing.expectEqual(@as(usize, if (resizing) 10001 else 65536), sink.sink.x_count);
++    }
++}
++
++const RecordingHistorySink = struct {
++    payloads: [8][1024]u8 = undefined,
++    fragments: [8]HistoryFragment = undefined,
++    count: usize = 0,
++    euros: usize = 0,
++    max_len: usize = 0,
++
++    fn receive(userdata: ?*anyopaque, fragment: *const HistoryFragment) callconv(lib.calling_conv) void {
++        const self: *RecordingHistorySink = @ptrCast(@alignCast(userdata.?));
++        const decoded = HistoryTestRow.decode(fragment);
++        self.euros += std.mem.count(u8, decoded.text(), "€");
++        self.max_len = @max(self.max_len, fragment.len);
++        if (self.count == self.fragments.len) return;
++        const len = @min(fragment.len, self.payloads[self.count].len);
++        @memcpy(self.payloads[self.count][0..len], fragment.data[0..len]);
++        self.fragments[self.count] = fragment.*;
++        self.fragments[self.count].data = &self.payloads[self.count];
++        self.fragments[self.count].len = len;
++        self.count += 1;
++    }
++
++    fn row(self: *const RecordingHistorySink, index: usize) HistoryTestRow {
++        return HistoryTestRow.decode(&self.fragments[index]);
++    }
++};
++
++test "durable history preserves styled Unicode rows" {
++    var t: Terminal = null;
++    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 2500, 2));
++    defer free(t);
++    var sink: RecordingHistorySink = .{};
++    try testing.expectEqual(Result.success, history_set_callback(t, RecordingHistorySink.receive, &sink));
++    var input: [8192]u8 = undefined;
++    var writer = std.Io.Writer.fixed(&input);
++    try writer.writeAll("\x1b[31m");
++    for (0..2000) |_| try writer.writeAll("€");
++    try writer.writeAll("\r\n\r\n");
++    vt_write(t, input[0..6].ptr, 6);
++    vt_write(t, input[6..writer.end].ptr, writer.end - 6);
++    try testing.expectEqual(@as(usize, 2000), sink.euros);
++    try testing.expect(sink.max_len < 7000);
++    const fragment = sink.fragments[0];
++    try testing.expectEqual(@as(u16, 2000), fragment.cells);
++    try testing.expectEqual(@as(u8, 0), fragment.flags);
++}
++
++test "durable history records styles, explicit spaces and background cells" {
++    var t: Terminal = null;
++    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 6, 2));
++    defer free(t);
++    var sink: RecordingHistorySink = .{};
++    try testing.expectEqual(Result.success, history_set_callback(t, RecordingHistorySink.receive, &sink));
++    const input = "\x1b[1;31mX\x1b[0m  \r\n\x1b[42m    \x1b[0m\r\n\r\n";
++    vt_write(t, input, input.len);
++    try testing.expectEqual(Result.success, history_finish(t));
++    const first = sink.row(0);
++    try testing.expectEqual(@as(usize, 3), first.cells);
++    try testing.expectEqualStrings("X  ", first.text());
++    try testing.expectEqual(@as(usize, 1), first.style_count);
++    try testing.expectEqual(@as(u64, 1), first.styles[0][0]);
++    try testing.expectEqual((@as(u64, 1) << 32) | 1, first.styles[0][1]);
++    try testing.expectEqual(@as(usize, 2), first.run_count);
++    try testing.expectEqual([3]usize{ 1, 1, 0 }, first.runs[0]);
++    try testing.expectEqual([3]usize{ 2, 0, 0 }, first.runs[1]);
++    const second = sink.row(1);
++    try testing.expectEqual(@as(usize, 4), second.cells);
++    try testing.expectEqual(@as(usize, 1), second.style_count);
++    try testing.expectEqual((@as(u64, 1) << 32) | 2, second.styles[0][2]);
++    const third = sink.row(2);
++    try testing.expectEqual(@as(usize, 0), third.cells);
++}
++
++test "durable history preserves wide graphemes across resize" {
++    var t: Terminal = null;
++    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 7, 2));
++    defer free(t);
++    const Sink = struct {
++        bases: usize = 0,
++        graphemes: usize = 0,
++        fn receive(userdata: ?*anyopaque, fragment: *const HistoryFragment) callconv(lib.calling_conv) void {
++            const self: *@This() = @ptrCast(@alignCast(userdata.?));
++            const row = HistoryTestRow.decode(fragment);
++            self.bases += std.mem.count(u8, row.text(), "👩");
++            self.graphemes += row.graphemes;
++            std.debug.assert(row.wide_count == std.mem.count(u8, row.text(), "👩") + std.mem.count(u8, row.text(), "💻"));
++        }
++    };
++    var sink: Sink = .{};
++    try testing.expectEqual(Result.success, history_set_callback(t, Sink.receive, &sink));
++    var input: [4096]u8 = undefined;
++    var writer = std.Io.Writer.fixed(&input);
++    for (0..300) |_| try writer.writeAll("👩‍💻");
++    vt_write(t, input[0..writer.end].ptr, writer.end);
++    for ([_][2]u16{ .{ 11, 5 }, .{ 3, 1 }, .{ 17, 4 }, .{ 5, 2 } }) |geometry| {
++        try testing.expectEqual(Result.success, resize(t, geometry[0], geometry[1], 8, 16));
++    }
++    try testing.expectEqual(Result.success, history_finish(t));
++    try testing.expectEqual(@as(usize, 300), sink.bases);
++    try testing.expectEqual(@as(usize, 300), sink.graphemes);
++}
++
++test "durable history records wide cells and wrap spacers" {
++    var t: Terminal = null;
++    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 4, 2));
++    defer free(t);
++    var sink: RecordingHistorySink = .{};
++    try testing.expectEqual(Result.success, history_set_callback(t, RecordingHistorySink.receive, &sink));
++    const input = "X界X\r\nXXX界\r\n\r\n";
++    vt_write(t, input, input.len);
++    try testing.expectEqual(Result.success, history_finish(t));
++    const first = sink.row(0);
++    try testing.expectEqual(@as(usize, 4), first.cells);
++    try testing.expectEqual(@as(usize, 1), first.wide_count);
++    try testing.expectEqual(@as(usize, 1), first.wide[0]);
++    try testing.expectEqualStrings("X界X", first.text());
++    const second = sink.row(1);
++    try testing.expectEqual(@as(usize, 3), second.cells);
++    try testing.expectEqual(@as(u8, 3), second.flags);
++    const third = sink.row(2);
++    try testing.expectEqual(@as(usize, 2), third.cells);
++    try testing.expectEqual(@as(u8, 0), third.flags);
++    try testing.expectEqual(@as(usize, 0), third.wide[0]);
++    try testing.expectEqual(sink.fragments[1].line_id, sink.fragments[2].line_id);
++}
++
++test "durable history records hyperlinks" {
++    var t: Terminal = null;
++    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 2));
++    defer free(t);
++    var sink: RecordingHistorySink = .{};
++    try testing.expectEqual(Result.success, history_set_callback(t, RecordingHistorySink.receive, &sink));
++    const input = "a\x1b]8;id=7;https://example.test/\x1b\\link\x1b]8;;\x1b\\b\r\n\r\n";
++    vt_write(t, input, input.len);
++    try testing.expectEqual(Result.success, history_finish(t));
++    const row = sink.row(0);
++    try testing.expectEqualStrings("alinkb", row.text());
++    try testing.expectEqual(@as(usize, 1), row.link_count);
++    try testing.expectEqualStrings("https://example.test/", row.links[0]);
++    try testing.expectEqualStrings("7", row.link_ids[0]);
++    try testing.expectEqual(@as(usize, 3), row.run_count);
++    try testing.expectEqual([3]usize{ 4, 0, 1 }, row.runs[1]);
++}
++
++test "durable history frontier survives reset and finalization" {
++    var t: Terminal = null;
++    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 4, 2));
++    defer free(t);
++    var sink: HistoryTestSink = .{};
++    try testing.expectEqual(Result.success, history_set_callback(t, HistoryTestSink.receive, &sink));
++    var frontier: HistoryFrontier = undefined;
++    const input = "XXXX\r\nXXXX\r\n\x1bc";
++    vt_write(t, input, input.len);
++    try testing.expectEqual(Result.success, history_frontier(t, &frontier));
++    try testing.expectEqual(@as(u64, 0), frontier.boundary_row);
++    try testing.expectEqual(@as(u16, 0), frontier.boundary_column);
++    try testing.expectEqual(Result.success, history_finish(t));
++    try testing.expectEqual(Result.success, history_frontier(t, &frontier));
++    try testing.expect(frontier.finished);
++    try testing.expectEqual(frontier.total_rows, frontier.boundary_row);
++}
++// END sandbox-station durable-history tests
++
+ test "new/free" {
+     var t: Terminal = null;
+     try testing.expectEqual(Result.success, new(

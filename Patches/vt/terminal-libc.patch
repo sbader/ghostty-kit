@@ -1,0 +1,6 @@
+diff --git a/src/build/GhosttyZig.zig b/src/build/GhosttyZig.zig
+--- a/src/build/GhosttyZig.zig
++++ b/src/build/GhosttyZig.zig
+@@ -126,1 +126,1 @@
+-        .link_libc = if (cfg.simd) true else null,
++        .link_libc = true,

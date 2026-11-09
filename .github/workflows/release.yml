@@ -1,0 +1,148 @@
+name: Release
+
+# Builds GhosttyKit.xcframework from Ghostty.ref and the patch queue and
+# publishes it on the tag from Script/storage-tag.sh.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      build_needed: ${{ steps.release.outputs.build_needed }}
+      ghostty_ref: ${{ steps.release.outputs.ghostty_ref }}
+      storage_tag: ${{ steps.release.outputs.storage_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve Tag
+        id: release
+        run: |
+          GHOSTTY_REF=$(tr -d '[:space:]' < Ghostty.ref)
+          STORAGE_TAG=$(./Script/storage-tag.sh)
+
+          gh api "repos/ghostty-org/ghostty/commits/$GHOSTTY_REF" --jq '.sha' >/dev/null
+
+          if git rev-parse "refs/tags/$STORAGE_TAG" >/dev/null 2>&1; then
+            echo "[*] $STORAGE_TAG already published; bump Ghostty.build to rebuild"
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          echo "ghostty_ref=$GHOSTTY_REF" >> "$GITHUB_OUTPUT"
+          echo "storage_tag=$STORAGE_TAG" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-target:
+    needs: prepare
+    if: needs.prepare.outputs.build_needed == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-macos
+            variant: macosx
+          - target: aarch64-ios
+            variant: iphoneos
+          - target: aarch64-ios-simulator
+            variant: iphonesimulator
+            cpu: apple_a17
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Fetch Ghostty
+        run: ./Script/fetch-ghostty.sh "$PWD/.build/ghostty"
+
+      - name: Build Target
+        run: |
+          export ZIG_CPU="${{ matrix.cpu }}"
+          ./Script/build-ghostty.sh "$PWD/.build/ghostty" "${{ matrix.target }}" "$PWD/.build/out"
+
+      - name: Pack Artifact
+        run: tar -czf "target--${{ matrix.variant }}.tar.gz" -C ./.build/out .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: target--${{ matrix.variant }}
+          path: target--${{ matrix.variant }}.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  merge-release:
+    needs: [prepare, build-target]
+    if: needs.prepare.outputs.build_needed == 'true'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: target--*
+          path: ./.build/tarballs
+          merge-multiple: true
+
+      - name: Unpack Variants
+        run: |
+          for tarball in ./.build/tarballs/target--*.tar.gz; do
+            VARIANT=$(basename "$tarball" .tar.gz | sed 's/^target--//')
+            mkdir -p "./.build/artifacts/$VARIANT"
+            tar -xzf "$tarball" -C "./.build/artifacts/$VARIANT"
+          done
+
+      - name: Merge XCFramework
+        run: |
+          ./Script/merge-xcframework.sh \
+            "$PWD/.build/artifacts" \
+            "$PWD/.build/GhosttyKit.xcframework" \
+            "$PWD/.build/GhosttyKit.xcframework.zip"
+
+      - name: Test XCFramework Consumer
+        run: ./Script/test-xcframework-consumer.sh "$PWD/.build/GhosttyKit.xcframework"
+
+      - name: Checksum
+        id: checksum
+        run: |
+          mv ./.build/GhosttyKit.xcframework.zip ./GhosttyKit.xcframework.zip
+          echo "checksum=$(swift package compute-checksum GhosttyKit.xcframework.zip)" >> "$GITHUB_OUTPUT"
+          echo "identity=$(cat ./.build/GhosttyKit.xcframework/Ghostty.identity)" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.storage_tag }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Ghostty: https://github.com/ghostty-org/ghostty/commit/${{ needs.prepare.outputs.ghostty_ref }}
+            Checksum: ${{ steps.checksum.outputs.checksum }}
+            Identity: ${{ steps.checksum.outputs.identity }}
+            Slices: macOS arm64, iOS arm64, iOS Simulator arm64
+          files: |
+            GhosttyKit.xcframework.zip
