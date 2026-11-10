@@ -1,0 +1,73 @@
+name: Ghostty main
+
+# Checks the patch queues against Ghostty main each week. Fails and lists the
+# patches that no longer apply, or opens a bump PR when they all do.
+
+on:
+  schedule:
+    - cron: '0 14 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  patches:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Zig
+        # Matches test.yml; bump.sh warns when Ghostty main needs newer.
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Bump to main
+        id: bump
+        run: |
+          set -o pipefail
+          ./Script/bump.sh main 2>&1 | tee bump.log
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "Ghostty main: https://github.com/ghostty-org/ghostty/commit/$(tr -d '[:space:]' < Ghostty.ref)"
+            echo
+            if [ "${{ steps.bump.outcome }}" = success ]; then
+              echo "Both patch queues apply and the Zig tests pass."
+            elif grep -qE '^\[(-|!)\]' bump.log; then
+              echo '```'
+              grep -E '^\[(-|!)\]' bump.log
+              echo '```'
+            else
+              echo "Failed after the patches applied; see the Bump to main log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ghostty commit
+        if: steps.bump.outcome == 'success'
+        id: ghostty
+        run: echo "sha=$(tr -d '[:space:]' < Ghostty.ref)" >> "$GITHUB_OUTPUT"
+
+      # Keeps one PR on the branch, moved to the newest passing main each week;
+      # does nothing when the pin already matches.
+      - name: Open bump PR
+        if: steps.bump.outcome == 'success'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: ghostty-main
+          add-paths: |
+            Ghostty.ref
+            Ghostty.build
+          commit-message: Bumps Ghostty to ${{ steps.ghostty.outputs.sha }}
+          title: Bumps Ghostty to ${{ steps.ghostty.outputs.sha }}
+          body: |
+            Ghostty: https://github.com/ghostty-org/ghostty/commit/${{ steps.ghostty.outputs.sha }}
+
+            Both patch queues apply and the Zig tests pass. After merging, pull, then run the app's `just terminal release` and sandbox-manager's `just terminal update`.
+          reviewers: ${{ github.repository_owner }}

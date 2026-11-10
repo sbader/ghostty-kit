@@ -25,11 +25,15 @@ fi
 CLEAN_DIR=$(mktemp -d)
 trap 'rm -rf "$CLEAN_DIR"' EXIT
 git -C "$SOURCE_DIR" archive "$GHOSTTY_REF" | tar -x -C "$CLEAN_DIR"
+# Each applies to the clean tree on its own; failures are reported at the end
+# so the ghostty queue is still checked.
+vt_failed=false
 for patch_file in Patches/vt/*.patch; do
     if ! output=$(patch --dry-run --batch --forward --fuzz=0 -d "$CLEAN_DIR" -p1 < "$patch_file" 2>&1); then
         echo "$output"
         echo "[-] failed to apply: $patch_file"
-        exit 1
+        vt_failed=true
+        continue
     fi
     echo "[+] applies cleanly: $patch_file"
 done
@@ -68,3 +72,4 @@ echo "[+] patch queue is idempotent"
         --summary failures
 )
 echo "[+] zig tests passed"
+[ "$vt_failed" = false ] || { echo "[-] Patches/vt failed"; exit 1; }
