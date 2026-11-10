@@ -1,4 +1,4 @@
-name: Ghostty main
+name: Ghostty Bump
 
 # Checks the patch queues against Ghostty main each week. Fails and lists the
 # patches that no longer apply, or opens a bump PR when they all do.
