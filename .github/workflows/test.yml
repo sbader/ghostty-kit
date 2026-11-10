@@ -17,7 +17,7 @@ jobs:
         # Keep in sync with minimum_zig_version in the pinned Ghostty's build.zig.zon.
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       - name: Test
         run: ./Script/test.sh
