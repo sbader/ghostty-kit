@@ -7,7 +7,7 @@
 #    2-byte aligned, and the libtool in Xcode 27 (cctools 27037) drops every
 #    misaligned 64-bit member *silently* — oniguruma, libintl, freetype, simd
 #    vanish from libghostty-fat.a and only the consuming app's link notices.
-# 2. libghostty-vt.dylib is not installed. The XCFramework ships libghostty.a
+# 2. libghostty-vt.dylib is not installed (upstream gates it after 042b16b6). The XCFramework ships libghostty.a
 #    only; the dylib's libc++ sub-compilation is what fails under Xcode 27
 #    (`INFINITY` undeclared in clamp_to_integral.h), and on visionOS it fails
 #    under every Xcode. Nothing downstream reads it.
@@ -25,6 +25,9 @@ fi
 
 if grep -q 'LIBGHOSTTY_SPM_NO_VT_DYLIB' build.zig; then
     echo "[+] libghostty-vt.dylib install already skipped"
+elif grep -q 'if (install_lib_vt) shared\.install(b\.getInstallStep());' build.zig; then
+    # Upstream installs libghostty-vt only for -Demit-lib-vt or dependency builds.
+    echo "[+] upstream skips the libghostty-vt.dylib install"
 else
     # `libghostty_vt_shared.install(...)` through 1.3.1; since upstream
     # made the shared lib optional it is `shared.install(...)` inside

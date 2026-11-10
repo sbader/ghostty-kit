@@ -144,8 +144,8 @@ pub fn destroy(self: *ExternalFrame) void {
 
 fn color(tag: u8, value: [3]u8) terminal.Style.Color {
     return switch (tag) {
-        1 => .{ .palette = value[0] },
-        2 => .{ .rgb = .{ .r = value[0], .g = value[1], .b = value[2] } },
+        1 => .palette(value[0]),
+        2 => .rgb(.{ .r = value[0], .g = value[1], .b = value[2] }),
         else => .none,
     };
 }
@@ -281,8 +281,8 @@ pub fn captureCell(
     var out: CCell = .{ .codepoint = cell.codepoint(), .wide = @intFromEnum(cell.wide) };
     var style: terminal.Style = if (cell.style_id != 0) page.styles.get(page.memory, cell.style_id).* else .{};
     switch (cell.content_tag) {
-        .bg_color_palette => style.bg_color = .{ .palette = cell.content.color_palette.data },
-        .bg_color_rgb => style.bg_color = .{ .rgb = .{ .r = cell.content.color_rgb.r, .g = cell.content.color_rgb.g, .b = cell.content.color_rgb.b } },
+        .bg_color_palette => style.bg_color = .palette(cell.content.color_palette.data),
+        .bg_color_rgb => style.bg_color = .rgb(.{ .r = cell.content.color_rgb.r, .g = cell.content.color_rgb.g, .b = cell.content.color_rgb.b }),
         .codepoint_grapheme => if (page.lookupGrapheme(cell)) |extra| {
             out.grapheme_offset = @intCast(graphemes.items.len);
             out.grapheme_len = @intCast(extra.len);
@@ -292,7 +292,7 @@ pub fn captureCell(
     }
     out.style_flags = @bitCast(style.flags);
     inline for (.{ .{ "fg_color", "fg_tag", "fg" }, .{ "bg_color", "bg_tag", "bg" }, .{ "underline_color", "underline_tag", "underline" } }) |names| {
-        switch (@field(style, names[0])) {
+        switch (@field(style, names[0]).value()) {
             .none => {},
             .palette => |index| {
                 @field(out, names[1]) = 1;
@@ -341,7 +341,7 @@ test "frame fills render rows with styles, graphemes, selection and cursor" {
     const first = state.row_data.items(.cells)[0];
     try testing.expectEqual(@as(u21, 'a'), first.get(0).raw.codepoint());
     try testing.expect(first.get(0).raw.hasStyling());
-    try testing.expectEqual(terminal.Style.Color{ .palette = 3 }, first.get(0).style.fg_color);
+    try testing.expectEqual(terminal.Style.Color.palette(3), first.get(0).style.fg_color);
     try testing.expect(first.get(0).style.flags.bold);
     try testing.expectEqual(terminal.page.Cell.Wide.wide, first.get(1).raw.wide);
     try testing.expectEqualSlices(u21, &.{0x200D}, first.get(1).grapheme);

@@ -238,16 +238,16 @@ typedef struct {
   int32_t cursor_x;
   int32_t cursor_y;
   uint32_t hovered_link;
-  const ghostty_frame_row_s* row_data;
-  const ghostty_frame_cell_s* cells;
-  const uint32_t* graphemes;
+  const ghostty_frame_row_s* GHOSTTY_NULLABLE row_data;
+  const ghostty_frame_cell_s* GHOSTTY_NULLABLE cells;
+  const uint32_t* GHOSTTY_NULLABLE graphemes;
   uint32_t grapheme_count;
 } ghostty_frame_s;
 
 typedef struct {
-  const uint8_t* uri;
+  const uint8_t* GHOSTTY_NULLABLE uri;
   uint32_t uri_len;
-  const uint8_t* id;
+  const uint8_t* GHOSTTY_NULLABLE id;
   uint32_t id_len;
 } ghostty_frame_link_s;
 
@@ -260,11 +260,11 @@ typedef struct {
   bool alternate_screen;
   bool synchronized;
   bool reserved;
-  ghostty_frame_cell_s* cells;
-  uint8_t* wraps;
-  uint32_t* graphemes;
+  ghostty_frame_cell_s* GHOSTTY_NULLABLE cells;
+  uint8_t* GHOSTTY_NULLABLE wraps;
+  uint32_t* GHOSTTY_NULLABLE graphemes;
   uint32_t grapheme_count;
-  ghostty_frame_link_s* links;
+  ghostty_frame_link_s* GHOSTTY_NULLABLE links;
   uint32_t link_count;
 } ghostty_frame_capture_s;
 

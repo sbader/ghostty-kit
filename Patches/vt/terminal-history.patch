@@ -1,6 +1,6 @@
 --- a/include/ghostty/vt/terminal.h
 +++ b/include/ghostty/vt/terminal.h
-@@ -3339,6 +3339,41 @@
+@@ -3256,6 +3256,41 @@ GHOSTTY_API GhosttyResult ghostty_terminal_set(GhosttyTerminal terminal,
   *
   * @ingroup terminal
   */
@@ -44,7 +44,7 @@
                                  size_t len);
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -331,6 +331,9 @@
+@@ -318,6 +318,9 @@ comptime {
          @export(&c.terminal_set, .{ .name = "ghostty_terminal_set" });
          @export(&c.terminal_vt_write, .{ .name = "ghostty_terminal_vt_write" });
          @export(&c.terminal_vt_write_until, .{ .name = "ghostty_terminal_vt_write_until" });
@@ -56,9 +56,9 @@
          @export(&c.terminal_compress, .{ .name = "ghostty_terminal_compress" });
 --- a/src/terminal/PageList.zig
 +++ b/src/terminal/PageList.zig
-@@ -459,6 +459,13 @@
- /// This is null until the first page fills up, and `reset` clears it.
- grow_hint: ?Capacity = null,
+@@ -462,6 +462,13 @@ recycle_node: ?*List.Node = null,
+ grow_hints: [grow_hint_pages]?GrowHint = @splat(null),
+ grow_hint_next: usize = 0,
  
 +history_observer: ?struct {
 +    callback: *const fn (*anyopaque, *PageList, usize) void,
@@ -70,7 +70,7 @@
  /// Limits for scrollback.
  limits: Limits,
  
-@@ -529,6 +536,10 @@
+@@ -532,6 +539,10 @@ pub const Viewport = union(enum) {
      pin,
  };
  
@@ -81,7 +81,7 @@
  /// Calculates the initial capacity for a new page for a given column
  /// count. This will attempt to fit within std_size at all times so we
  /// can use our memory pool, but if cols is too big, this will return a
-@@ -992,6 +1003,8 @@
+@@ -995,6 +1006,8 @@ pub fn deinit(self: *PageList) void {
  /// This can't fail because we always retain at least enough allocated
  /// memory to fit the active area.
  pub fn reset(self: *PageList) void {
@@ -90,7 +90,7 @@
      defer self.assertIntegrity();
  
      // Reset discards all scrollback, so there is nothing left to compress.
-@@ -1708,6 +1721,13 @@
+@@ -1724,6 +1737,13 @@ const ReflowCursor = struct {
                  // This row has pins
                  row_has_pins = true;
  
@@ -104,7 +104,7 @@
                  if (cursor_pin != null and p == cursor_pin.?) continue;
  
                  // If this pin is in the blanks on the right and past the end
-@@ -4061,6 +4081,9 @@
+@@ -4111,6 +4131,9 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
          self.pages.first != self.pages.last and
          self.page_size + new_size > self.limits.max(.bytes))
      prune: {
@@ -114,7 +114,7 @@
          const first = self.pages.popFirst().?;
          assert(first != last);
  
-@@ -5755,6 +5778,7 @@
+@@ -6114,6 +6137,7 @@ pub fn eraseHistory(
      self: *PageList,
      bl_pt: ?point.Point,
  ) void {
@@ -122,7 +122,7 @@
      self.eraseRows(.{ .history = .{} }, bl_pt);
  }
  
-@@ -7338,6 +7362,8 @@
+@@ -7698,6 +7722,8 @@ const Limits = struct {
  
              if (removed == 0) pagelist.page_compression.markActivity();
  
@@ -133,7 +133,7 @@
              // Automatic pruning invalidates the content represented by pins in
 --- a/src/terminal/Screen.zig
 +++ b/src/terminal/Screen.zig
-@@ -990,7 +990,7 @@
+@@ -990,7 +990,7 @@ pub fn cursorDownScroll(self: *Screen) !void {
      }
  
      // If we have no scrollback, then we shift all our rows instead.
@@ -144,7 +144,7 @@
          // the cells.
 --- a/src/terminal/c/main.zig
 +++ b/src/terminal/c/main.zig
-@@ -194,6 +194,9 @@
+@@ -199,6 +199,9 @@ pub const terminal_resize = terminal.resize;
  pub const terminal_set = terminal.set;
  pub const terminal_vt_write = terminal.vt_write;
  pub const terminal_vt_write_until = terminal.vt_write_until;
@@ -156,7 +156,7 @@
  pub const terminal_compress = terminal.compress;
 --- a/src/terminal/c/terminal.zig
 +++ b/src/terminal/c/terminal.zig
-@@ -86,6 +86,7 @@
+@@ -87,6 +87,7 @@ const TerminalWrapper = struct {
      terminfo_name_buf: [Handler.max_terminfo_name_bytes]u8,
      stream: Stream,
      effects: Effects = .{},
@@ -164,7 +164,7 @@
      tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
      searches: std.AutoArrayHashMapUnmanaged(*search_c.SearchWrapper, void) = .{},
  
-@@ -1054,6 +1055,423 @@
+@@ -1063,6 +1064,423 @@ fn new_(
      );
  }
  
@@ -286,7 +286,7 @@
 +    }
 +
 +    fn color(self: *HistoryRowEncoder, value: @import("../style.zig").Style.Color) void {
-+        switch (value) {
++        switch (value.value()) {
 +            .none => self.byte(0),
 +            .palette => |index| {
 +                self.byte(1);
@@ -371,8 +371,8 @@
 +            const value: u32 = @truncate(key);
 +            var style: @import("../style.zig").Style = .{};
 +            switch (tag) {
-+                1 => style.bg_color = .{ .palette = @truncate(value) },
-+                2 => style.bg_color = .{ .rgb = .{ .r = @truncate(value >> 16), .g = @truncate(value >> 8), .b = @truncate(value) } },
++                1 => style.bg_color = .palette(@truncate(value)),
++                2 => style.bg_color = .rgb(.{ .r = @truncate(value >> 16), .g = @truncate(value >> 8), .b = @truncate(value) }),
 +                else => style = self.page.styles.get(self.page.memory, @intCast(value)).*,
 +            }
 +            self.varint(@as(u16, @bitCast(style.flags)));
@@ -587,16 +587,16 @@
 +
  pub fn vt_write(
      terminal_: Terminal,
-     ptr: [*]const u8,
-@@ -1061,6 +1479,7 @@
- ) callconv(lib.calling_conv) void {
+     ptr_: ?[*]const u8,
+@@ -1071,6 +1489,7 @@ pub fn vt_write(
      const wrapper = terminal_ orelse return;
+     const ptr = ptr_ orelse return;
      wrapper.stream.nextSlice(ptr[0..len]);
 +    historyFlush(wrapper, 0);
  }
  
  /// A boundary as a C bit flag. The C API takes and reports boundaries as a
-@@ -1843,6 +2262,7 @@
+@@ -1857,6 +2276,7 @@ pub fn resize(
          error.InvalidValue => .invalid_value,
          error.OutOfMemory => .out_of_memory,
      };
@@ -604,7 +604,7 @@
  
      return .success;
  }
-@@ -2244,6 +2664,12 @@
+@@ -2255,6 +2675,12 @@ pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
      const t = wrapper.terminal;
      const alloc = t.gpa();
  
@@ -617,7 +617,7 @@
      for (wrapper.tracked_grid_refs.keys()) |ref| ref.terminal = null;
      wrapper.tracked_grid_refs.deinit(alloc);
      for (wrapper.searches.keys()) |search| search.terminal = null;
-@@ -2263,6 +2689,418 @@
+@@ -2274,6 +2700,418 @@ fn testEnableContinuation(terminal: Terminal) !void {
      );
  }
  
