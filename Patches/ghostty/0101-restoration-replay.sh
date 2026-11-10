@@ -55,7 +55,7 @@ src.insert_before(
 """,
     marker="    pub fn discardIfReplaySideEffect(self: Message) bool {\n",
 )
-# OSC 52 writes reach the pasteboard: only this device can write it, so live output must not drop them.
+# OSC 52 reaches the pasteboard: only this device can read or write it, so live output must not drop either.
 src.replace(
     """            .clipboard_write => |value| {
                 switch (value.req) {
@@ -67,6 +67,11 @@ src.replace(
 """,
     """            // OSC 52 writes still land: the host cannot reach this device's pasteboard.
 """,
+)
+src.replace(
+    """            .report_title, .clipboard_read, .ring_bell,""",
+    """            // OSC 52 reads still reach the apprt, which answers or denies them: the host cannot read this device's pasteboard.
+            .report_title, .ring_bell,""",
 )
 src.append(
     """
@@ -85,6 +90,7 @@ src.insert_after(
 """,
     """    const write: Message = .{ .clipboard_write = .{ .clipboard_type = .standard, .req = try .init(testing.allocator, @as([]const u8, "copied")) } };
     try testing.expect(!write.discardIfReplaySideEffect());
+    try testing.expect(!(Message{ .clipboard_read = .standard }).discardIfReplaySideEffect());
 """,
 )
 src.save()
