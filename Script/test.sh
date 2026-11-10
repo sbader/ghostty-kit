@@ -26,7 +26,11 @@ CLEAN_DIR=$(mktemp -d)
 trap 'rm -rf "$CLEAN_DIR"' EXIT
 git -C "$SOURCE_DIR" archive "$GHOSTTY_REF" | tar -x -C "$CLEAN_DIR"
 for patch_file in Patches/vt/*.patch; do
-    patch --dry-run --batch --forward --fuzz=0 -d "$CLEAN_DIR" -p1 < "$patch_file" >/dev/null
+    if ! output=$(patch --dry-run --batch --forward --fuzz=0 -d "$CLEAN_DIR" -p1 < "$patch_file" 2>&1); then
+        echo "$output"
+        echo "[-] failed to apply: $patch_file"
+        exit 1
+    fi
     echo "[+] applies cleanly: $patch_file"
 done
 

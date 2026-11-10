@@ -11,10 +11,18 @@ Builds `GhosttyKit.xcframework` (arm64 macOS, iOS, iOS Simulator) from Ghostty a
 
 | Command | Purpose |
 |---|---|
-| `Script/build.sh [--source <checkout>]` | Build `.build/GhosttyKit.xcframework` and its zip |
-| `Script/test.sh [--source <checkout>]` | Check both patch queues and run the patch Zig tests |
-| `Script/verify-xcframework.sh <xcframework\|zip>` | Check slices, identity and required symbols |
-| `Script/test-xcframework-consumer.sh [xcframework]` | Build a Swift package against the xcframework |
+| `just bump [ref]` | Pin `Ghostty.ref` to a Ghostty ref (default `main`) and run `just test` |
+| `just test` | Check both patch queues and run the patch Zig tests |
+| `just build` | Build `.build/GhosttyKit.xcframework` and its zip |
+| `just verify` | Check the local build and build a consumer against it |
+| `just release` | Publish the pushed `Ghostty.ref` and `Ghostty.build` through `release.yml` |
+
+## Bumping Ghostty
+
+1. `just bump [ref]`, fix failing patches, `just build`
+2. App and sandbox-manager: `just terminal local <ghostty-kit checkout>`, then test
+3. Commit and push, then app `just terminal release`
+4. sandbox-manager: `just terminal update`
 
 ## Releases
 
