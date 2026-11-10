@@ -60,7 +60,7 @@ pub fn linkTextAtPos(self: *Surface, alloc: Allocator, pos: apprt.CursorPos) !?[
             .sel = link.selection,
             .trim = false,
         }),
-        ._open_osc8 => try alloc.dupeZ(u8, self.osc8URI(link.selection.start()) orelse return null),
+        ._open_osc8 => try alloc.dupeSentinel(u8, self.osc8URI(link.selection.start()) orelse return null, 0),
     };
 }
 

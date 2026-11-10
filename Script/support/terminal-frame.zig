@@ -176,6 +176,7 @@ pub fn fill(self: *const ExternalFrame, alloc: Allocator, state: *terminal.Rende
             .dirty = true,
             .selection = null,
             .highlights = .empty,
+            .placeholders = .empty,
             .applied_styles = .empty,
         });
     } else if (state.row_data.len > self.rows) {
@@ -202,13 +203,15 @@ pub fn fill(self: *const ExternalFrame, alloc: Allocator, state: *terminal.Rende
         rows.items(.dirty),
         rows.items(.selection),
         rows.items(.highlights),
+        rows.items(.placeholders),
         rows.items(.applied_styles),
         rows.items(.serial),
-    ) |y, *arena_state, *raw, *cells, *dirty, *selection, *highlights, *applied, *serial| {
+    ) |y, *arena_state, *raw, *cells, *dirty, *selection, *highlights, *placeholders, *applied, *serial| {
         var arena = arena_state.promote(alloc);
         defer arena_state.* = arena.state;
         _ = arena.reset(.retain_capacity);
         highlights.* = .empty;
+        placeholders.* = .empty;
         applied.clearRetainingCapacity();
         if (cells.len != self.columns) try cells.resize(alloc, self.columns);
         raw.* = @bitCast(@as(u64, 0));

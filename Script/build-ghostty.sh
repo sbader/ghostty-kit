@@ -39,6 +39,18 @@ MODULE_CACHE_DIR="${CLANG_MODULE_CACHE_ROOT:-$CACHE_ROOT/clang-module-cache}/$ZI
 # A patch that has to fetch a Zig package (0017) shares the build's cache.
 ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" ./Script/apply-patches.sh "$SOURCE_DIR"
 
+# iOS builds against a patched copy of Zig's std when Patches/zig has one for
+# this Zig; see prepare-zig-lib.sh.
+if [[ "$ZIG_TARGET" == *-ios* ]]; then
+    if [ -f "$ROOT_DIR/Patches/zig/$(zig version)-ios-std.patch" ]; then
+        ZIG_LIB_DIR=$(./Script/prepare-zig-lib.sh "$CACHE_ROOT")
+        export ZIG_LIB_DIR
+        echo "[*] $ZIG_TARGET: ZIG_LIB_DIR=$ZIG_LIB_DIR"
+    else
+        echo "[*] $ZIG_TARGET: no std patch for Zig $(zig version), using the stock std"
+    fi
+fi
+
 echo "[*] building Ghostty static library…"
 echo "    target: $ZIG_TARGET"
 echo "    source: $SOURCE_DIR"
@@ -63,7 +75,7 @@ CURRENT_STAMP=$(
         echo "$ZIG_TARGET" "${ZIG_OPTIMIZE:-ReleaseFast}"
         # Patch *content*, not just names -- editing a patch in place must
         # invalidate, which a filename listing would miss.
-        cat "$ROOT_DIR"/Patches/ghostty/* "$ROOT_DIR"/Script/support/*.py "$ROOT_DIR"/Script/support/*.zig
+        cat "$ROOT_DIR"/Patches/ghostty/* "$ROOT_DIR"/Patches/zig/* "$ROOT_DIR"/Script/support/*.py "$ROOT_DIR"/Script/support/*.zig
     } | shasum -a 256 | cut -d' ' -f1
 )
 

@@ -181,11 +181,11 @@ src.replace('''                .{
             ).add(self.size.padding);''')
 src.replace('''                @floatFromInt(terminal_size.height + self.size.padding.bottom),
                 -1 * @as(f32, @floatFromInt(self.size.padding.top)),
-            );
+            ));
             self.uniforms.grid_padding = .{
                 @floatFromInt(blank.top),''', '''                @as(f32, @floatFromInt(terminal_size.height + self.size.padding.bottom)) + self.external_frame_offset,
                 -1 * @as(f32, @floatFromInt(self.size.padding.top)) + self.external_frame_offset,
-            );
+            ));
             // A frame scrolled by a fraction of a row moves the grid up.
             self.uniforms.grid_padding = .{
                 @as(f32, @floatFromInt(blank.top)) - self.external_frame_offset,''')

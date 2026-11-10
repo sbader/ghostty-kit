@@ -4,7 +4,7 @@ Builds `GhosttyKit.xcframework` (arm64 macOS, iOS, iOS Simulator) from Ghostty a
 
 ## Requirements
 
-- Zig 0.16.0
+- Zig 0.17.0
 - macOS with Xcode and the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`) for builds; Linux or macOS for tests
 
 ## Commands

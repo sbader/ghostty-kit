@@ -1,6 +1,6 @@
 --- a/include/ghostty/vt/terminal.h
 +++ b/include/ghostty/vt/terminal.h
-@@ -2387,6 +2387,41 @@
+@@ -3339,6 +3339,41 @@
   *
   * @ingroup terminal
   */
@@ -44,21 +44,21 @@
                                  size_t len);
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -321,6 +321,9 @@
-         @export(&c.terminal_resize, .{ .name = "ghostty_terminal_resize" });
+@@ -331,6 +331,9 @@
          @export(&c.terminal_set, .{ .name = "ghostty_terminal_set" });
          @export(&c.terminal_vt_write, .{ .name = "ghostty_terminal_vt_write" });
+         @export(&c.terminal_vt_write_until, .{ .name = "ghostty_terminal_vt_write_until" });
 +        @export(&c.terminal_history_set_callback, .{ .name = "ghostty_terminal_history_set_callback" });
 +        @export(&c.terminal_history_finish, .{ .name = "ghostty_terminal_history_finish" });
 +        @export(&c.terminal_history_frontier, .{ .name = "ghostty_terminal_history_frontier" });
-         @export(&c.terminal_vt_write_until_ground, .{ .name = "ghostty_terminal_vt_write_until_ground" });
          @export(&c.terminal_scroll_viewport, .{ .name = "ghostty_terminal_scroll_viewport" });
          @export(&c.terminal_compression_activity, .{ .name = "ghostty_terminal_compression_activity" });
+         @export(&c.terminal_compress, .{ .name = "ghostty_terminal_compress" });
 --- a/src/terminal/PageList.zig
 +++ b/src/terminal/PageList.zig
-@@ -449,6 +449,13 @@
- /// outside of an in-progress reflow.
- recycle_node: ?*List.Node = null,
+@@ -459,6 +459,13 @@
+ /// This is null until the first page fills up, and `reset` clears it.
+ grow_hint: ?Capacity = null,
  
 +history_observer: ?struct {
 +    callback: *const fn (*anyopaque, *PageList, usize) void,
@@ -70,7 +70,7 @@
  /// Limits for scrollback.
  limits: Limits,
  
-@@ -519,6 +526,10 @@
+@@ -529,6 +536,10 @@
      pin,
  };
  
@@ -81,7 +81,7 @@
  /// Calculates the initial capacity for a new page for a given column
  /// count. This will attempt to fit within std_size at all times so we
  /// can use our memory pool, but if cols is too big, this will return a
-@@ -982,6 +993,8 @@
+@@ -992,6 +1003,8 @@
  /// This can't fail because we always retain at least enough allocated
  /// memory to fit the active area.
  pub fn reset(self: *PageList) void {
@@ -90,7 +90,7 @@
      defer self.assertIntegrity();
  
      // Reset discards all scrollback, so there is nothing left to compress.
-@@ -1692,6 +1705,13 @@
+@@ -1708,6 +1721,13 @@
                  // This row has pins
                  row_has_pins = true;
  
@@ -104,9 +104,9 @@
                  if (cursor_pin != null and p == cursor_pin.?) continue;
  
                  // If this pin is in the blanks on the right and past the end
-@@ -4039,6 +4059,9 @@
+@@ -4061,6 +4081,9 @@
          self.pages.first != self.pages.last and
-         self.page_size + PagePool.item_size > self.limits.max(.bytes))
+         self.page_size + new_size > self.limits.max(.bytes))
      prune: {
 +        if (self.total_rows + 1 >= self.pages.first.?.rows() + self.rows) {
 +            self.historyBeforeDiscard(if (self.total_rows - self.pages.first.?.rows() < self.rows) 1 else 0);
@@ -114,7 +114,7 @@
          const first = self.pages.popFirst().?;
          assert(first != last);
  
-@@ -5481,6 +5504,7 @@
+@@ -5755,6 +5778,7 @@
      self: *PageList,
      bl_pt: ?point.Point,
  ) void {
@@ -122,7 +122,7 @@
      self.eraseRows(.{ .history = .{} }, bl_pt);
  }
  
-@@ -7011,6 +7035,8 @@
+@@ -7338,6 +7362,8 @@
  
              if (removed == 0) pagelist.page_compression.markActivity();
  
@@ -133,7 +133,7 @@
              // Automatic pruning invalidates the content represented by pins in
 --- a/src/terminal/Screen.zig
 +++ b/src/terminal/Screen.zig
-@@ -930,7 +930,7 @@
+@@ -990,7 +990,7 @@
      }
  
      // If we have no scrollback, then we shift all our rows instead.
@@ -144,19 +144,19 @@
          // the cells.
 --- a/src/terminal/c/main.zig
 +++ b/src/terminal/c/main.zig
-@@ -187,6 +187,9 @@
- pub const terminal_resize = terminal.resize;
+@@ -194,6 +194,9 @@
  pub const terminal_set = terminal.set;
  pub const terminal_vt_write = terminal.vt_write;
+ pub const terminal_vt_write_until = terminal.vt_write_until;
 +pub const terminal_history_set_callback = terminal.history_set_callback;
 +pub const terminal_history_finish = terminal.history_finish;
 +pub const terminal_history_frontier = terminal.history_frontier;
- pub const terminal_vt_write_until_ground = terminal.vt_write_until_ground;
  pub const terminal_scroll_viewport = terminal.scroll_viewport;
  pub const terminal_compression_activity = terminal.compression_activity;
+ pub const terminal_compress = terminal.compress;
 --- a/src/terminal/c/terminal.zig
 +++ b/src/terminal/c/terminal.zig
-@@ -84,6 +84,7 @@
+@@ -86,6 +86,7 @@
      terminfo_name_buf: [Handler.max_terminfo_name_bytes]u8,
      stream: Stream,
      effects: Effects = .{},
@@ -164,7 +164,7 @@
      tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
      searches: std.AutoArrayHashMapUnmanaged(*search_c.SearchWrapper, void) = .{},
  
-@@ -870,6 +871,423 @@
+@@ -1054,6 +1055,423 @@
      );
  }
  
@@ -588,15 +588,15 @@
  pub fn vt_write(
      terminal_: Terminal,
      ptr: [*]const u8,
-@@ -877,6 +1295,7 @@
+@@ -1061,6 +1479,7 @@
  ) callconv(lib.calling_conv) void {
      const wrapper = terminal_ orelse return;
      wrapper.stream.nextSlice(ptr[0..len]);
 +    historyFlush(wrapper, 0);
  }
  
- pub fn vt_write_until_ground(
-@@ -1525,6 +1944,7 @@
+ /// A boundary as a C bit flag. The C API takes and reports boundaries as a
+@@ -1843,6 +2262,7 @@
          error.InvalidValue => .invalid_value,
          error.OutOfMemory => .out_of_memory,
      };
@@ -604,7 +604,7 @@
  
      return .success;
  }
-@@ -1856,6 +2276,12 @@
+@@ -2244,6 +2664,12 @@
      const t = wrapper.terminal;
      const alloc = t.gpa();
  
@@ -617,7 +617,7 @@
      for (wrapper.tracked_grid_refs.keys()) |ref| ref.terminal = null;
      wrapper.tracked_grid_refs.deinit(alloc);
      for (wrapper.searches.keys()) |search| search.terminal = null;
-@@ -1875,6 +2301,418 @@
+@@ -2263,6 +2689,418 @@
      );
  }
  
