@@ -155,6 +155,10 @@ for library in libraries:
         for symbol in REQUIRED_SYMBOLS:
             if "_" + symbol not in defined:
                 raise SystemExit(f"[!] {identifier}/{architecture} archive missing {symbol}")
+        # libintl is LGPL; 0021 and -Di18n=false keep it out of the archive.
+        libintl = sorted(symbol for symbol in defined if "libintl_" in symbol)
+        if libintl:
+            raise SystemExit(f"[!] {identifier}/{architecture} archive links GNU libintl: {', '.join(libintl[:5])}")
 
     with open(modulemap_path, "r", encoding="utf-8") as handle:
         modulemap = handle.read()

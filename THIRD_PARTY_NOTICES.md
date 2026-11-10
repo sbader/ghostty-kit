@@ -5,7 +5,6 @@
 | Component | License |
 |---|---|
 | Ghostty | MIT (below) |
-| GNU libintl (gettext 0.24) | LGPL-2.1-or-later |
 | FreeType | FreeType License (FTL) |
 | zlib | zlib |
 | libpng | libpng |
@@ -14,8 +13,6 @@
 | simdutf | Apache-2.0 or MIT |
 | Wuffs | Apache-2.0 |
 | stb | MIT or public domain |
-
-libintl is LGPL-2.1-or-later; an app that statically links this archive carries LGPL obligations for it.
 
 ## Ghostty
 

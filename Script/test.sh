@@ -59,6 +59,7 @@ echo "[+] patch queue is idempotent"
         -Dsentry=false \
         -Dcustom-shaders=false \
         -Dinspector=false \
+        -Di18n=false \
         -Dsimd=false \
         --summary failures
 )
